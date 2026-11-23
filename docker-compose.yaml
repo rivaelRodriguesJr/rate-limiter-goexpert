@@ -1,0 +1,39 @@
+services:
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      REDIS_ADDR: redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  test:
+    profiles: ["test"]
+    image: golang:1.25
+    working_dir: /src
+    volumes:
+      - .:/src
+      - gomod:/go/pkg/mod
+    environment:
+      REDIS_ADDR: redis:6379
+      CGO_ENABLED: "1"
+    command: go test -race -count=1 ./...
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  gomod:
