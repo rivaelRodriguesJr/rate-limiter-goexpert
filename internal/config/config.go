@@ -1,5 +1,3 @@
-// Package config loads and validates settings from environment variables,
-// optionally seeded from a .env file.
 package config
 
 import (
@@ -13,7 +11,7 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// Config is the full application configuration.
+// Config has all the settings of the app.
 type Config struct {
 	RateLimitIP   int
 	RateLimitTok  int
@@ -26,101 +24,109 @@ type Config struct {
 	FailOpen      bool
 }
 
-// Load reads a .env file from the working directory (if present; real
-// environment variables always win) and then parses the environment.
-func Load() (Config, error) {
-	if err := godotenv.Load(); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return Config{}, fmt.Errorf("reading .env: %w", err)
-	}
-	return FromLookup(os.LookupEnv)
-}
+// Load reads the .env file (if it exists) and then the environment variables.
+func Load() (*Config, error) {
+	// the .env file is optional, so we ignore the error here
+	godotenv.Load()
 
-// FromLookup takes a function instead of calling os.Getenv directly so tests can
-// feed fake values (no need to set real env vars). It collects ALL errors and
-// reports them together, instead of stopping at the first one.
-// FromLookup parses configuration using the given lookup function.
-func FromLookup(lookup func(string) (string, bool)) (Config, error) {
-	get := func(key, def string) string {
-		if v, ok := lookup(key); ok && strings.TrimSpace(v) != "" {
-			return strings.TrimSpace(v)
-		}
-		return def
-	}
-	var errs []error
-	posInt := func(key, def string) int {
-		raw := get(key, def)
-		n, err := strconv.Atoi(raw)
-		if err != nil || n <= 0 {
-			errs = append(errs, fmt.Errorf("%s must be a positive integer, got %q", key, raw))
-			return 0
-		}
-		return n
-	}
+	cfg := &Config{}
+	var err error
 
-	c := Config{
-		RateLimitIP:  posInt("RATE_LIMIT_IP", "10"),
-		RateLimitTok: posInt("RATE_LIMIT_TOKEN", "100"),
-		ServerPort:   get("SERVER_PORT", "8080"),
-	}
-	c.RedisPassword = get("REDIS_PASSWORD", "")
-	c.BlockDuration = time.Duration(posInt("BLOCK_DURATION_SECONDS", "300")) * time.Second
-
-	if p, err := strconv.Atoi(c.ServerPort); err != nil || p < 1 || p > 65535 {
-		errs = append(errs, fmt.Errorf("SERVER_PORT must be a port number (1-65535), got %q", c.ServerPort))
-	}
-
-	db := get("REDIS_DB", "0")
-	if n, err := strconv.Atoi(db); err != nil || n < 0 {
-		errs = append(errs, fmt.Errorf("REDIS_DB must be a non-negative integer, got %q", db))
-	} else {
-		c.RedisDB = n
-	}
-
-	if addr := get("REDIS_ADDR", ""); addr != "" {
-		c.RedisAddr = addr
-	} else {
-		c.RedisAddr = get("REDIS_HOST", "localhost") + ":" + get("REDIS_PORT", "6379")
-	}
-
-	switch strings.ToLower(get("FAIL_OPEN", "true")) {
-	case "true", "1", "yes":
-		c.FailOpen = true
-	case "false", "0", "no":
-		c.FailOpen = false
-	default:
-		errs = append(errs, fmt.Errorf("FAIL_OPEN must be true or false, got %q", get("FAIL_OPEN", "")))
-	}
-
-	tl, err := ParseTokenLimits(get("TOKEN_LIMITS", ""))
+	cfg.RateLimitIP, err = getInt("RATE_LIMIT_IP", 10, 1)
 	if err != nil {
-		errs = append(errs, err)
+		return nil, err
 	}
-	c.TokenLimits = tl
 
-	if len(errs) > 0 {
-		return Config{}, fmt.Errorf("invalid configuration: %w", errors.Join(errs...))
+	cfg.RateLimitTok, err = getInt("RATE_LIMIT_TOKEN", 100, 1)
+	if err != nil {
+		return nil, err
 	}
-	return c, nil
+
+	seconds, err := getInt("BLOCK_DURATION_SECONDS", 300, 1)
+	if err != nil {
+		return nil, err
+	}
+	cfg.BlockDuration = time.Duration(seconds) * time.Second
+
+	cfg.RedisDB, err = getInt("REDIS_DB", 0, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	port, err := getInt("SERVER_PORT", 8080, 1)
+	if err != nil {
+		return nil, err
+	}
+	cfg.ServerPort = strconv.Itoa(port)
+
+	cfg.TokenLimits, err = parseTokenLimits(os.Getenv("TOKEN_LIMITS"))
+	if err != nil {
+		return nil, err
+	}
+
+	// REDIS_ADDR wins, if it is empty we use REDIS_HOST and REDIS_PORT
+	cfg.RedisAddr = os.Getenv("REDIS_ADDR")
+	if cfg.RedisAddr == "" {
+		host := os.Getenv("REDIS_HOST")
+		if host == "" {
+			host = "localhost"
+		}
+		redisPort := os.Getenv("REDIS_PORT")
+		if redisPort == "" {
+			redisPort = "6379"
+		}
+		cfg.RedisAddr = host + ":" + redisPort
+	}
+
+	cfg.RedisPassword = os.Getenv("REDIS_PASSWORD")
+
+	cfg.FailOpen = true
+	failOpen := os.Getenv("FAIL_OPEN")
+	if failOpen != "" {
+		cfg.FailOpen, err = strconv.ParseBool(failOpen)
+		if err != nil {
+			return nil, fmt.Errorf("FAIL_OPEN must be true or false, got %q", failOpen)
+		}
+	}
+
+	return cfg, nil
 }
 
-// ParseTokenLimits parses "token:limit,token2:limit2".
-func ParseTokenLimits(s string) (map[string]int, error) {
-	out := make(map[string]int)
-	if strings.TrimSpace(s) == "" {
-		return out, nil
+// getInt reads a number from the environment. If it is not set we use the default.
+func getInt(name string, defaultValue int, min int) (int, error) {
+	text := os.Getenv(name)
+	if text == "" {
+		return defaultValue, nil
 	}
-	for _, pair := range strings.Split(s, ",") {
-		pair = strings.TrimSpace(pair)
-		if pair == "" {
-			continue
-		}
-		tok, lim, ok := strings.Cut(pair, ":")
-		tok = strings.TrimSpace(tok)
-		n, err := strconv.Atoi(strings.TrimSpace(lim))
-		if !ok || tok == "" || err != nil || n <= 0 {
-			return nil, fmt.Errorf("TOKEN_LIMITS entry %q must look like token:limit with a positive limit", pair)
-		}
-		out[tok] = n
+
+	number, err := strconv.Atoi(text)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a number, got %q", name, text)
 	}
-	return out, nil
+	if number < min {
+		return 0, fmt.Errorf("%s must be at least %d, got %d", name, min, number)
+	}
+	return number, nil
+}
+
+// parseTokenLimits turns "abc:100,xyz:50" into a map.
+func parseTokenLimits(text string) (map[string]int, error) {
+	limits := make(map[string]int)
+	if strings.TrimSpace(text) == "" {
+		return limits, nil
+	}
+
+	for _, pair := range strings.Split(text, ",") {
+		parts := strings.Split(strings.TrimSpace(pair), ":")
+		if len(parts) != 2 || parts[0] == "" {
+			return nil, errors.New("TOKEN_LIMITS must look like token:limit,token:limit")
+		}
+
+		limit, err := strconv.Atoi(parts[1])
+		if err != nil || limit < 1 {
+			return nil, fmt.Errorf("TOKEN_LIMITS has a bad limit in %q", pair)
+		}
+		limits[parts[0]] = limit
+	}
+	return limits, nil
 }

@@ -1,95 +1,95 @@
 # Rate Limiter
 
-An HTTP middleware (Go, `net/http` + chi) that limits requests per second by **client IP** or by **access token** (`API_KEY` header), persisting state in **Redis**. A token's limit takes precedence over the IP limit.
+Um middleware HTTP (Go, `net/http` + chi) que limita requisições por segundo por **IP do cliente** ou por **token de acesso** (header `API_KEY`), guardando o estado no **Redis**. O limite do token tem precedência sobre o limite do IP.
 
-## Architecture
+## Arquitetura
 
 ```
-request ─▶ middleware.RateLimit ─▶ limiter.Limiter ─▶ storage.Store (interface)
-           (IP + API_KEY, 429)     (business logic)      ├─ Redis   (production)
-                                                         └─ Memory  (unit tests)
+requisição ─▶ middleware.RateLimit ─▶ limiter.Limiter ─▶ storage.Store (interface)
+              (IP + API_KEY, 429)     (regra de negócio)    ├─ Redis   (produção)
+                                                            └─ Memory  (testes unitários)
 ```
 
-- `internal/middleware` – extracts IP/token, calls the limiter, writes the 429.
-- `internal/limiter` – HTTP-independent logic: block check → counter (1s window) → block on overflow.
-- `internal/storage` – `Store` interface (strategy) with Redis (Lua script, atomic `INCR`+`PEXPIRE`; blocks are keys with TTL) and in-memory implementations (injectable `Clock`).
-- `internal/config` – env vars + optional `.env`; fails fast on invalid values.
+- `internal/middleware` – extrai IP/token, chama o limiter e escreve o 429.
+- `internal/limiter` – lógica independente de HTTP: verifica bloqueio → contador (janela de 1s) → bloqueia ao estourar o limite.
+- `internal/storage` – interface `Store` (strategy) com implementação em Redis (`INCR` + `PEXPIRE NX` em uma transação; os bloqueios são chaves com TTL) e em memória (com `Clock` injetável).
+- `internal/config` – variáveis de ambiente + `.env` opcional; falha logo na inicialização se algum valor for inválido.
 
-When the limit is exceeded the client gets `429` with the body
-`you have reached the maximum number of requests or actions allowed within a certain time frame` and is blocked for `BLOCK_DURATION_SECONDS`; every request in that period gets the same 429. A `Retry-After` header is also set.
+Quando o limite é excedido, o cliente recebe `429` com o corpo
+`you have reached the maximum number of requests or actions allowed within a certain time frame` e fica bloqueado por `BLOCK_DURATION_SECONDS`; toda requisição nesse período recebe o mesmo 429. O header `Retry-After` também é enviado.
 
-**Redis failures:** errors are logged; with `FAIL_OPEN=true` (default) requests are allowed, with `false` they are rejected with 429.
+**Falhas do Redis:** os erros são logados; com `FAIL_OPEN=true` (padrão) as requisições são permitidas, com `false` são rejeitadas com 429.
 
-**Client IP:** first `X-Forwarded-For` entry, else `X-Real-IP`, else `RemoteAddr` without port. These headers are client-controlled; only trust them behind a proxy that overwrites them.
+**IP do cliente:** primeiro valor de `X-Forwarded-For`, senão `X-Real-IP`, senão `RemoteAddr` sem a porta. Esses headers são controlados pelo cliente; só confie neles atrás de um proxy que os sobrescreva.
 
-## Configuration
+## Configuração
 
-| Variable | Default | Description |
+| Variável | Padrão | Descrição |
 |---|---|---|
-| `RATE_LIMIT_IP` | `10` | Max requests/second per IP |
-| `RATE_LIMIT_TOKEN` | `100` | Default max requests/second per token |
-| `TOKEN_LIMITS` | _(empty)_ | Per-token overrides, `token:limit,token:limit` |
-| `BLOCK_DURATION_SECONDS` | `300` | Block time after exceeding the limit |
-| `REDIS_ADDR` | _(unset)_ | `host:port`; if unset, `REDIS_HOST`:`REDIS_PORT` is used |
-| `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` | Used when `REDIS_ADDR` is unset |
-| `REDIS_PASSWORD` | _(empty)_ | Redis password |
-| `REDIS_DB` | `0` | Redis database |
-| `SERVER_PORT` | `8080` | HTTP port |
-| `FAIL_OPEN` | `true` | Allow requests when Redis fails |
+| `RATE_LIMIT_IP` | `10` | Máximo de requisições/segundo por IP |
+| `RATE_LIMIT_TOKEN` | `100` | Máximo de requisições/segundo por token (padrão) |
+| `TOKEN_LIMITS` | _(vazio)_ | Limites específicos por token, `token:limite,token:limite` |
+| `BLOCK_DURATION_SECONDS` | `300` | Tempo de bloqueio após exceder o limite |
+| `REDIS_ADDR` | _(não definido)_ | `host:porta`; se não definido, usa `REDIS_HOST`:`REDIS_PORT` |
+| `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` | Usados quando `REDIS_ADDR` não está definido |
+| `REDIS_PASSWORD` | _(vazio)_ | Senha do Redis |
+| `REDIS_DB` | `0` | Banco do Redis |
+| `SERVER_PORT` | `8080` | Porta HTTP |
+| `FAIL_OPEN` | `true` | Permite requisições quando o Redis falha |
 
-Copy `.env.example` to `.env` to customize (real environment variables win over `.env`).
+Copie `.env.example` para `.env` para personalizar (variáveis de ambiente reais têm prioridade sobre o `.env`).
 
-## Run
+## Como rodar
 
 ```sh
-cp .env.example .env   # optional
+cp .env.example .env   # opcional
 docker compose up --build
 ```
 
-## Tests (Docker only)
+## Testes (somente Docker)
 
 ```sh
-docker compose run --rm test     # or: make test
+docker compose run --rm test     # ou: make test
 docker compose --profile test down -v
 ```
 
-This runs `go test -race ./...` against the Redis container. Without Redis, the Redis integration test is skipped when run locally (`go test -race ./...`).
+Isso executa `go test -race ./...` contra o container do Redis. Sem Redis (rodando localmente com `go test -race ./...`), o teste de integração do Redis é pulado.
 
-## Examples
+## Exemplos
 
-With `RATE_LIMIT_IP=2` and `TOKEN_LIMITS=abc123:5`:
+Com `RATE_LIMIT_IP=2` e `TOKEN_LIMITS=abc123:5`:
 
 ```sh
 for i in 1 2 3; do curl -s -o /dev/null -w "%{http_code}\n" localhost:8080/; done
 # 200 200 429
-curl -i localhost:8080/            # 429, body: you have reached the maximum ...
-# Token precedence: the same IP, but token abc123 allows 5 req/s
+curl -i localhost:8080/            # 429, corpo: you have reached the maximum ...
+# Precedência do token: mesmo IP, mas o token abc123 permite 5 req/s
 for i in 1 2 3 4 5 6; do curl -s -o /dev/null -w "%{http_code}\n" -H "API_KEY: abc123" localhost:8080/; done
 # 200 200 200 200 200 429
 ```
 
-## Swapping the persistence strategy
+## Trocando a estratégia de persistência
 
-1. Create `internal/storage/<backend>.go` with a type implementing `storage.Store`:
-   `Incr(ctx, key, window) (int64, error)` (atomic; first increment starts the window, the counter expires after it), `BlockTTL(ctx, key) (time.Duration, error)` (0 when not blocked), `Block(ctx, key, d) error` (auto-expiring), `Ping`, `Close`.
-2. Add `var _ storage.Store = (*YourStore)(nil)` and run the shared contract in `internal/storage/storage_test.go` against it.
-3. In `cmd/server/main.go`, replace the `storage.NewRedis(...)` block with your constructor. Nothing else changes: the limiter and middleware only know the interface.
+1. Crie `internal/storage/<backend>.go` com um tipo que implemente `storage.Store`:
+   `Incr(ctx, key, window) (int64, error)` (atômico; o primeiro incremento inicia a janela e o contador expira depois dela), `BlockTTL(ctx, key) (time.Duration, error)` (0 quando não está bloqueado), `Block(ctx, key, d) error` (expira sozinho), `Ping` e `Close`.
+2. Adicione `var _ storage.Store = (*SeuStore)(nil)` e escreva testes parecidos com os de `internal/storage/storage_test.go` (contador, janela, bloqueio e expiração).
+3. Em `cmd/server/main.go`, troque o bloco `storage.NewRedis(...)` pelo construtor do seu backend. Mais nada muda: o limiter e o middleware só conhecem a interface.
 
-## Go cheat sheet for Java / Node.js developers
+## Cola de Go para quem vem de Java / Node.js
 
-| In Go | Think of it as |
+| Em Go | Pense como |
 |---|---|
-| `package` / `internal/` | Java package / Node module. `internal/` can't be imported from outside this project |
-| Uppercase name (`Limiter`) vs lowercase (`store`) | `public` vs `private` |
-| `struct` + methods | A class without inheritance |
-| `interface` (e.g. `storage.Store`) | Java interface / TS type, but implemented implicitly |
-| `value, err := f()` + `if err != nil` | Instead of `try/catch`. Errors are normal return values |
+| `package` / `internal/` | Package do Java / módulo do Node. `internal/` não pode ser importado de fora deste projeto |
+| Nome maiúsculo (`Limiter`) vs minúsculo (`store`) | `public` vs `private` |
+| `struct` + métodos | Uma classe sem herança |
+| `interface` (ex.: `storage.Store`) | Interface do Java / type do TS, mas implementada de forma implícita |
+| `valor, err := f()` + `if err != nil` | No lugar de `try/catch`. Erros são valores de retorno normais |
 | `defer x.Close()` | `finally` / `try-with-resources` |
-| `context.Context` | Cancellation + timeout token passed down calls (like `AbortController`) |
-| `go func() {...}()` | Starts a lightweight thread (goroutine) |
-| `chan` | A thread-safe queue for goroutines to talk to each other |
-| `sync.Mutex` | `synchronized` / a lock |
-| `*Limiter` | A reference/pointer to the object (avoids copying it) |
-| `_test.go` files, `go test` | Test files sit next to the code, no extra framework needed |
+| `context.Context` | Token de cancelamento + timeout passado pelas chamadas (como o `AbortController`) |
+| `go func() {...}()` | Inicia uma thread leve (goroutine) |
+| `chan` | Uma fila thread-safe para goroutines conversarem entre si |
+| `sync.Mutex` | `synchronized` / um lock |
+| `*Limiter` | Uma referência/ponteiro para o objeto (evita copiá-lo) |
+| arquivos `_test.go`, `go test` | Os testes ficam ao lado do código, sem framework extra |
 
-Suggested reading order: `cmd/server/main.go` → `internal/limiter/limiter.go` → `internal/middleware/ratelimit.go` → `internal/storage/memory.go` → the tests.
+Ordem de leitura sugerida: `cmd/server/main.go` → `internal/limiter/limiter.go` → `internal/middleware/ratelimit.go` → `internal/storage/memory.go` → os testes.

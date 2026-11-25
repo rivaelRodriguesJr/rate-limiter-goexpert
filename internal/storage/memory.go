@@ -7,22 +7,21 @@ import (
 )
 
 type counter struct {
-	n       int64
-	expires time.Time
+	value   int64
+	endTime time.Time
 }
 
-// Memory is an in-memory Store, intended for tests and local development.
+// Memory keeps everything in maps. We use it in the tests.
 type Memory struct {
 	clock    Clock
-	mu       sync.Mutex
+	mutex    sync.Mutex // protects the maps, because many requests run at the same time
 	counters map[string]counter
 	blocks   map[string]time.Time
 }
 
-// NewMemory creates a Memory store. A nil clock means the system clock.
 func NewMemory(clock Clock) *Memory {
 	if clock == nil {
-		clock = SystemClock{}
+		clock = RealClock{}
 	}
 	return &Memory{
 		clock:    clock,
@@ -31,46 +30,52 @@ func NewMemory(clock Clock) *Memory {
 	}
 }
 
-// Incr implements Store.
-func (m *Memory) Incr(_ context.Context, key string, window time.Duration) (int64, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (m *Memory) Incr(ctx context.Context, key string, window time.Duration) (int64, error) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
 	now := m.clock.Now()
-	c, ok := m.counters[key]
-	if !ok || !now.Before(c.expires) {
-		c = counter{expires: now.Add(window)}
+
+	c, found := m.counters[key]
+	if !found || !now.Before(c.endTime) {
+		// no counter yet, or the old window is over: start again
+		c = counter{value: 0, endTime: now.Add(window)}
 	}
-	c.n++
+	c.value++
 	m.counters[key] = c
-	return c.n, nil
+
+	return c.value, nil
 }
 
-// BlockTTL implements Store.
-func (m *Memory) BlockTTL(_ context.Context, key string) (time.Duration, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	until, ok := m.blocks[key]
-	if !ok {
+func (m *Memory) BlockTTL(ctx context.Context, key string) (time.Duration, error) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	endTime, found := m.blocks[key]
+	if !found {
 		return 0, nil
 	}
+
 	now := m.clock.Now()
-	if !now.Before(until) {
+	if !now.Before(endTime) {
 		delete(m.blocks, key)
 		return 0, nil
 	}
-	return until.Sub(now), nil
+	return endTime.Sub(now), nil
 }
 
-// Block implements Store.
-func (m *Memory) Block(_ context.Context, key string, d time.Duration) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.blocks[key] = m.clock.Now().Add(d)
+func (m *Memory) Block(ctx context.Context, key string, duration time.Duration) error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	m.blocks[key] = m.clock.Now().Add(duration)
 	return nil
 }
 
-// Ping implements Store.
-func (m *Memory) Ping(context.Context) error { return nil }
+func (m *Memory) Ping(ctx context.Context) error {
+	return nil
+}
 
-// Close implements Store.
-func (m *Memory) Close() error { return nil }
+func (m *Memory) Close() error {
+	return nil
+}

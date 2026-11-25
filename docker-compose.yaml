@@ -1,6 +1,8 @@
 services:
   redis:
     image: redis:7-alpine
+    ports:
+      - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
@@ -22,7 +24,7 @@ services:
 
   test:
     profiles: ["test"]
-    image: golang:1.25
+    image: golang:1.26
     working_dir: /src
     volumes:
       - .:/src

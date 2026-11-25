@@ -1,5 +1,3 @@
-// Package storage defines the persistence strategy used by the limiter and
-// ships a Redis and an in-memory implementation.
 package storage
 
 import (
@@ -7,37 +5,31 @@ import (
 	"time"
 )
 
-// Store is the "strategy" interface: the limiter only depends on this, never on Redis.
-// Redis and Memory both have these methods, so both count as a Store with no
-// `implements` keyword (Go interfaces are satisfied implicitly).
-// Store is the persistence strategy required by the limiter. Implementations
-// must be safe for concurrent use.
+// Store is where the limiter saves its data.
+// Redis and Memory both have these methods, so both can be used as a Store.
 type Store interface {
-	// Incr atomically increments the counter at key and returns the new value.
-	// The first increment of a key starts a window of the given length; once it
-	// elapses the counter disappears and starts again from 1.
+	// Incr adds 1 to the counter of the key and returns the new value.
+	// The counter is deleted after the window time.
 	Incr(ctx context.Context, key string, window time.Duration) (int64, error)
 
-	// BlockTTL returns the remaining block time for key, or 0 if key is not blocked.
+	// BlockTTL returns how long the key is still blocked (0 if it is not blocked).
 	BlockTTL(ctx context.Context, key string) (time.Duration, error)
 
-	// Block marks key as blocked for d. The block expires automatically.
-	Block(ctx context.Context, key string, d time.Duration) error
+	// Block blocks the key for some time. The block goes away by itself.
+	Block(ctx context.Context, key string, duration time.Duration) error
 
-	// Ping checks that the backend is reachable.
 	Ping(ctx context.Context) error
-
-	// Close releases resources held by the store.
 	Close() error
 }
 
-// Clock is an injectable time source.
+// Clock gives the current time. In the tests we use a fake one.
 type Clock interface {
 	Now() time.Time
 }
 
-// SystemClock is the real wall clock.
-type SystemClock struct{}
+// RealClock uses the real time.
+type RealClock struct{}
 
-// Now returns time.Now().
-func (SystemClock) Now() time.Time { return time.Now() }
+func (RealClock) Now() time.Time {
+	return time.Now()
+}

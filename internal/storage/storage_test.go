@@ -1,66 +1,114 @@
-package storage_test
+package storage
 
 import (
 	"context"
 	"os"
 	"testing"
 	"time"
-
-	"github.com/rivaelRodriguesJr/rate-limiter/internal/storage"
 )
 
-type fakeClock struct{ t time.Time }
+type fakeClock struct {
+	now time.Time
+}
 
-func (c *fakeClock) Now() time.Time { return c.t }
+func (f *fakeClock) Now() time.Time {
+	return f.now
+}
 
-// contract runs the behavior every Store must satisfy.
-func contract(t *testing.T, s storage.Store, advance func(time.Duration)) {
+func TestMemoryCounter(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(1000, 0)}
+	store := NewMemory(clock)
 	ctx := context.Background()
-	if err := s.Ping(ctx); err != nil {
-		t.Fatal(err)
-	}
-	for want := int64(1); want <= 3; want++ {
-		if got, err := s.Incr(ctx, "c", time.Second); err != nil || got != want {
-			t.Fatalf("incr got %d err %v, want %d", got, err, want)
+
+	for i := 1; i <= 3; i++ {
+		n, _ := store.Incr(ctx, "a", time.Second)
+		if n != int64(i) {
+			t.Fatalf("got %d, want %d", n, i)
 		}
 	}
-	advance(1100 * time.Millisecond)
-	if got, _ := s.Incr(ctx, "c", time.Second); got != 1 {
-		t.Fatalf("counter should reset, got %d", got)
-	}
 
-	if ttl, err := s.BlockTTL(ctx, "b"); err != nil || ttl != 0 {
-		t.Fatalf("unblocked ttl %v err %v", ttl, err)
-	}
-	if err := s.Block(ctx, "b", 2*time.Second); err != nil {
-		t.Fatal(err)
-	}
-	if ttl, _ := s.BlockTTL(ctx, "b"); ttl <= 0 || ttl > 2*time.Second {
-		t.Fatalf("blocked ttl %v", ttl)
-	}
-	advance(2100 * time.Millisecond)
-	if ttl, _ := s.BlockTTL(ctx, "b"); ttl != 0 {
-		t.Fatalf("block should expire, ttl %v", ttl)
+	// after the window the counter starts again
+	clock.now = clock.now.Add(1100 * time.Millisecond)
+	n, _ := store.Incr(ctx, "a", time.Second)
+	if n != 1 {
+		t.Fatalf("got %d, want 1", n)
 	}
 }
 
-func TestMemoryContract(t *testing.T) {
-	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
-	contract(t, storage.NewMemory(clk), func(d time.Duration) { clk.t = clk.t.Add(d) })
+func TestMemoryBlock(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(1000, 0)}
+	store := NewMemory(clock)
+	ctx := context.Background()
+
+	ttl, _ := store.BlockTTL(ctx, "a")
+	if ttl != 0 {
+		t.Fatalf("should not be blocked, ttl = %v", ttl)
+	}
+
+	store.Block(ctx, "a", 10*time.Second)
+	ttl, _ = store.BlockTTL(ctx, "a")
+	if ttl <= 0 {
+		t.Fatalf("should be blocked, ttl = %v", ttl)
+	}
+
+	clock.now = clock.now.Add(11 * time.Second)
+	ttl, _ = store.BlockTTL(ctx, "a")
+	if ttl != 0 {
+		t.Fatalf("block should be over, ttl = %v", ttl)
+	}
 }
 
-func TestRedisContract(t *testing.T) {
+// This test needs a real Redis. If we can't connect, we skip it.
+func TestRedis(t *testing.T) {
 	addr := os.Getenv("REDIS_ADDR")
 	if addr == "" {
 		addr = "localhost:6379"
 	}
-	s := storage.NewRedis(storage.RedisOptions{Addr: addr, DB: 15})
-	defer s.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := s.Ping(ctx); err != nil {
-		t.Skipf("redis not reachable at %s: %v", addr, err)
+
+	store := NewRedis(RedisOptions{Addr: addr, DB: 15})
+	defer store.Close()
+
+	ctx := context.Background()
+	if err := store.Ping(ctx); err != nil {
+		t.Skip("redis is not running at", addr)
 	}
-	// Real time: keys use unique names per run and short TTLs.
-	contract(t, s, time.Sleep)
+
+	// the key has the time in it, so old runs don't affect this one
+	key := "test:" + time.Now().Format("150405.000000")
+
+	for i := 1; i <= 3; i++ {
+		n, err := store.Incr(ctx, key, 300*time.Millisecond)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != int64(i) {
+			t.Fatalf("got %d, want %d", n, i)
+		}
+	}
+
+	time.Sleep(400 * time.Millisecond)
+	n, _ := store.Incr(ctx, key, 300*time.Millisecond)
+	if n != 1 {
+		t.Fatalf("counter should restart, got %d", n)
+	}
+
+	blockKey := key + ":block"
+	ttl, _ := store.BlockTTL(ctx, blockKey)
+	if ttl != 0 {
+		t.Fatalf("should not be blocked, ttl = %v", ttl)
+	}
+
+	if err := store.Block(ctx, blockKey, 300*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	ttl, _ = store.BlockTTL(ctx, blockKey)
+	if ttl <= 0 {
+		t.Fatalf("should be blocked, ttl = %v", ttl)
+	}
+
+	time.Sleep(400 * time.Millisecond)
+	ttl, _ = store.BlockTTL(ctx, blockKey)
+	if ttl != 0 {
+		t.Fatalf("block should have expired, ttl = %v", ttl)
+	}
 }

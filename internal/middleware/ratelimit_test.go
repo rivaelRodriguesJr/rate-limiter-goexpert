@@ -1,4 +1,4 @@
-package middleware_test
+package middleware
 
 import (
 	"net/http"
@@ -7,95 +7,127 @@ import (
 	"time"
 
 	"github.com/rivaelRodriguesJr/rate-limiter/internal/limiter"
-	"github.com/rivaelRodriguesJr/rate-limiter/internal/middleware"
 	"github.com/rivaelRodriguesJr/rate-limiter/internal/storage"
 )
 
-func handler(ipLimit, tokLimit int, tokens map[string]int) http.Handler {
+const expectedMessage = "you have reached the maximum number of requests or actions allowed within a certain time frame"
+
+// newTestServer makes a handler with the rate limiter and the memory store.
+func newTestServer(ipLimit int, tokenLimit int, tokens map[string]int) http.Handler {
 	l := limiter.New(storage.NewMemory(nil), limiter.Config{
-		IPLimit: ipLimit, TokenLimit: tokLimit, TokenLimits: tokens,
-		BlockDuration: time.Minute, FailOpen: true,
-	}, nil)
-	return middleware.RateLimit(l)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("ok"))
-	}))
+		IPLimit:       ipLimit,
+		TokenLimit:    tokenLimit,
+		TokenLimits:   tokens,
+		BlockDuration: time.Minute,
+		FailOpen:      true,
+	})
+
+	okHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+	return RateLimit(l)(okHandler)
 }
 
-func do(h http.Handler, remote, token string) *httptest.ResponseRecorder {
-	r := httptest.NewRequest(http.MethodGet, "/", nil)
-	r.RemoteAddr = remote
+// send makes one fake request and returns the response.
+func send(h http.Handler, remoteAddr string, token string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest("GET", "/", nil)
+	req.RemoteAddr = remoteAddr
 	if token != "" {
-		r.Header.Set("API_KEY", token)
+		req.Header.Set("API_KEY", token)
 	}
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, r)
-	return w
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
 }
 
-func TestAllowedThenExactly429(t *testing.T) {
-	h := handler(2, 10, nil)
-	for i := 0; i < 2; i++ {
-		if w := do(h, "1.2.3.4:5555", ""); w.Code != http.StatusOK {
-			t.Fatalf("req %d: status %d", i, w.Code)
-		}
-	}
-	w := do(h, "1.2.3.4:5556", "")
-	if w.Code != http.StatusTooManyRequests {
-		t.Fatalf("status %d, want 429", w.Code)
-	}
-	const want = "you have reached the maximum number of requests or actions allowed within a certain time frame"
-	if w.Body.String() != want {
-		t.Fatalf("body %q", w.Body.String())
-	}
-	if w.Header().Get("Retry-After") == "" {
-		t.Fatal("missing Retry-After")
-	}
-	// Still blocked afterwards, same response.
-	if w := do(h, "1.2.3.4:5557", ""); w.Code != 429 || w.Body.String() != want {
-		t.Fatalf("blocked request: %d %q", w.Code, w.Body.String())
-	}
-}
+func TestAllowedThen429(t *testing.T) {
+	h := newTestServer(2, 10, nil)
 
-func TestPrecedence(t *testing.T) {
-	h := handler(2, 2, map[string]int{"abc123": 5})
-	for i := 0; i < 5; i++ {
-		if w := do(h, "1.2.3.4:1", "abc123"); w.Code != 200 {
-			t.Fatalf("token req %d: %d", i, w.Code)
+	for i := 1; i <= 2; i++ {
+		rec := send(h, "1.2.3.4:1000", "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d: status %d, want 200", i, rec.Code)
 		}
 	}
-	if w := do(h, "1.2.3.4:1", "abc123"); w.Code != 429 {
-		t.Fatalf("6th token req: %d", w.Code)
+
+	rec := send(h, "1.2.3.4:1001", "")
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status %d, want 429", rec.Code)
 	}
-	for i := 0; i < 2; i++ {
-		if w := do(h, "1.2.3.4:1", ""); w.Code != 200 {
-			t.Fatalf("ip req %d: %d", i, w.Code)
-		}
+	if rec.Body.String() != expectedMessage {
+		t.Fatalf("wrong body: %q", rec.Body.String())
 	}
-	if w := do(h, "1.2.3.4:1", ""); w.Code != 429 {
-		t.Fatalf("3rd ip req: %d", w.Code)
+	if rec.Header().Get("Retry-After") == "" {
+		t.Fatal("Retry-After header is missing")
 	}
 }
 
-func TestClientIP(t *testing.T) {
-	cases := []struct {
-		name, remote, xff, xri, want string
-	}{
-		{"remote", "10.0.0.1:1234", "", "", "10.0.0.1"},
-		{"xff first", "10.0.0.1:1234", "203.0.113.5, 70.1.1.1", "9.9.9.9", "203.0.113.5"},
-		{"x-real-ip", "10.0.0.1:1234", "", "198.51.100.7", "198.51.100.7"},
-		{"no port", "10.0.0.1", "", "", "10.0.0.1"},
+func TestStaysBlocked(t *testing.T) {
+	h := newTestServer(1, 10, nil)
+
+	send(h, "1.2.3.4:1000", "")
+	send(h, "1.2.3.4:1000", "") // this one gets blocked
+
+	rec := send(h, "1.2.3.4:1000", "")
+	if rec.Code != http.StatusTooManyRequests || rec.Body.String() != expectedMessage {
+		t.Fatalf("should still be blocked, got %d %q", rec.Code, rec.Body.String())
 	}
-	for _, c := range cases {
-		r := httptest.NewRequest(http.MethodGet, "/", nil)
-		r.RemoteAddr = c.remote
-		if c.xff != "" {
-			r.Header.Set("X-Forwarded-For", c.xff)
+}
+
+func TestTokenBeatsIP(t *testing.T) {
+	h := newTestServer(2, 2, map[string]int{"abc123": 5})
+
+	for i := 1; i <= 5; i++ {
+		rec := send(h, "1.2.3.4:1000", "abc123")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("token request %d: status %d, want 200", i, rec.Code)
 		}
-		if c.xri != "" {
-			r.Header.Set("X-Real-IP", c.xri)
+	}
+	rec := send(h, "1.2.3.4:1000", "abc123")
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("6th token request: status %d, want 429", rec.Code)
+	}
+
+	// no token: the IP limit (2) is used
+	for i := 1; i <= 2; i++ {
+		rec := send(h, "1.2.3.4:1000", "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("ip request %d: status %d, want 200", i, rec.Code)
 		}
-		if got := middleware.ClientIP(r); got != c.want {
-			t.Errorf("%s: got %q want %q", c.name, got, c.want)
-		}
+	}
+	rec = send(h, "1.2.3.4:1000", "")
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("3rd ip request: status %d, want 429", rec.Code)
+	}
+}
+
+func TestClientIPFromRemoteAddr(t *testing.T) {
+	req := httptest.NewRequest("GET", "/", nil)
+	req.RemoteAddr = "10.0.0.1:1234"
+
+	if ip := ClientIP(req); ip != "10.0.0.1" {
+		t.Fatalf("got %q", ip)
+	}
+}
+
+func TestClientIPFromForwardedFor(t *testing.T) {
+	req := httptest.NewRequest("GET", "/", nil)
+	req.RemoteAddr = "10.0.0.1:1234"
+	req.Header.Set("X-Forwarded-For", "203.0.113.5, 70.1.1.1")
+	req.Header.Set("X-Real-IP", "9.9.9.9")
+
+	if ip := ClientIP(req); ip != "203.0.113.5" {
+		t.Fatalf("got %q", ip)
+	}
+}
+
+func TestClientIPFromRealIP(t *testing.T) {
+	req := httptest.NewRequest("GET", "/", nil)
+	req.RemoteAddr = "10.0.0.1:1234"
+	req.Header.Set("X-Real-IP", "198.51.100.7")
+
+	if ip := ClientIP(req); ip != "198.51.100.7" {
+		t.Fatalf("got %q", ip)
 	}
 }
