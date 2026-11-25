@@ -74,22 +74,3 @@ for i in 1 2 3 4 5 6; do curl -s -o /dev/null -w "%{http_code}\n" -H "API_KEY: a
    `Incr(ctx, key, window) (int64, error)` (atômico; o primeiro incremento inicia a janela e o contador expira depois dela), `BlockTTL(ctx, key) (time.Duration, error)` (0 quando não está bloqueado), `Block(ctx, key, d) error` (expira sozinho), `Ping` e `Close`.
 2. Adicione `var _ storage.Store = (*SeuStore)(nil)` e escreva testes parecidos com os de `internal/storage/storage_test.go` (contador, janela, bloqueio e expiração).
 3. Em `cmd/server/main.go`, troque o bloco `storage.NewRedis(...)` pelo construtor do seu backend. Mais nada muda: o limiter e o middleware só conhecem a interface.
-
-## Cola de Go para quem vem de Java / Node.js
-
-| Em Go | Pense como |
-|---|---|
-| `package` / `internal/` | Package do Java / módulo do Node. `internal/` não pode ser importado de fora deste projeto |
-| Nome maiúsculo (`Limiter`) vs minúsculo (`store`) | `public` vs `private` |
-| `struct` + métodos | Uma classe sem herança |
-| `interface` (ex.: `storage.Store`) | Interface do Java / type do TS, mas implementada de forma implícita |
-| `valor, err := f()` + `if err != nil` | No lugar de `try/catch`. Erros são valores de retorno normais |
-| `defer x.Close()` | `finally` / `try-with-resources` |
-| `context.Context` | Token de cancelamento + timeout passado pelas chamadas (como o `AbortController`) |
-| `go func() {...}()` | Inicia uma thread leve (goroutine) |
-| `chan` | Uma fila thread-safe para goroutines conversarem entre si |
-| `sync.Mutex` | `synchronized` / um lock |
-| `*Limiter` | Uma referência/ponteiro para o objeto (evita copiá-lo) |
-| arquivos `_test.go`, `go test` | Os testes ficam ao lado do código, sem framework extra |
-
-Ordem de leitura sugerida: `cmd/server/main.go` → `internal/limiter/limiter.go` → `internal/middleware/ratelimit.go` → `internal/storage/memory.go` → os testes.
